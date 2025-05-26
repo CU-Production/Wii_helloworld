@@ -1,4 +1,3 @@
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
@@ -6,137 +5,121 @@
 #include <gccore.h>
 #include <wiiuse/wpad.h>
 
-#define DEFAULT_FIFO_SIZE	(256*1024)
+GXRModeObj	*screenMode;
+static void	*frameBuffer;
+static vu8	readyForCopy;
+#define	FIFO_SIZE (256*1024)
 
-static void *frameBuffer[2] = { NULL, NULL};
-GXRModeObj *rmode;
+s16	vertices[] ATTRIBUTE_ALIGN(32) = {
+  0, 15, 0,
+  -15, -15, 0,
+  15,	-15, 0};
 
-//---------------------------------------------------------------------------------
-int main( int argc, char **argv ){
-//---------------------------------------------------------------------------------
-  f32 yscale;
+u8 colors[]	ATTRIBUTE_ALIGN(32)	= {
+  255, 0,	0, 255,		// red
+  0, 255,	0, 255,		// green
+  0, 0, 255, 255};	// blue
 
-  u32 xfbHeight;
+static void	copy_buffers(u32 unused);
 
-  Mtx	view;
-  Mtx44 perspective;
+int	main(void) {
+  Mtx	viewMatrix;
+  Mtx44	projection;
+  GXColor	backgroundColor	= {0, 0, 0,	255};
+  void *fifoBuffer = NULL;
 
-  u32	fb = 0; 	// initial framebuffer index
-  GXColor background = {0, 0, 0, 0xff};
-
-
-  // init the vi.
   VIDEO_Init();
   WPAD_Init();
 
-  rmode = VIDEO_GetPreferredMode(NULL);
+  screenMode = VIDEO_GetPreferredMode(NULL);
 
-  // allocate 2 framebuffers for double buffering
-  frameBuffer[0] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
-  frameBuffer[1] = MEM_K0_TO_K1(SYS_AllocateFramebuffer(rmode));
+  frameBuffer	= MEM_K0_TO_K1(SYS_AllocateFramebuffer(screenMode));
 
-  VIDEO_Configure(rmode);
-  VIDEO_SetNextFramebuffer(frameBuffer[fb]);
+  VIDEO_Configure(screenMode);
+  VIDEO_SetNextFramebuffer(frameBuffer);
+  VIDEO_SetPostRetraceCallback(copy_buffers);
   VIDEO_SetBlack(false);
   VIDEO_Flush();
-  VIDEO_WaitVSync();
-  if(rmode->viTVMode&VI_NON_INTERLACE) VIDEO_WaitVSync();
 
-  // setup the fifo and then init the flipper
-  void *gp_fifo = NULL;
-  gp_fifo = memalign(32,DEFAULT_FIFO_SIZE);
-  memset(gp_fifo,0,DEFAULT_FIFO_SIZE);
+  fifoBuffer = MEM_K0_TO_K1(memalign(32,FIFO_SIZE));
+  memset(fifoBuffer,	0, FIFO_SIZE);
 
-  GX_Init(gp_fifo,DEFAULT_FIFO_SIZE);
-
-  // clears the bg to color and clears the z buffer
-  GX_SetCopyClear(background, 0x00ffffff);
-
-  // other gx setup
-  GX_SetViewport(0,0,rmode->fbWidth,rmode->efbHeight,0,1);
-  yscale = GX_GetYScaleFactor(rmode->efbHeight,rmode->xfbHeight);
-  xfbHeight = GX_SetDispCopyYScale(yscale);
-  GX_SetScissor(0,0,rmode->fbWidth,rmode->efbHeight);
-  GX_SetDispCopySrc(0,0,rmode->fbWidth,rmode->efbHeight);
-  GX_SetDispCopyDst(rmode->fbWidth,xfbHeight);
-  GX_SetCopyFilter(rmode->aa,rmode->sample_pattern,GX_TRUE,rmode->vfilter);
-  GX_SetFieldMode(rmode->field_rendering,((rmode->viHeight==2*rmode->xfbHeight)?GX_ENABLE:GX_DISABLE));
+  GX_Init(fifoBuffer, FIFO_SIZE);
+  GX_SetCopyClear(backgroundColor, 0x00ffffff);
+  GX_SetViewport(0,0,screenMode->fbWidth,screenMode->efbHeight,0,1);
+  GX_SetDispCopyYScale((f32)screenMode->xfbHeight/(f32)screenMode->efbHeight);
+  GX_SetScissor(0,0,screenMode->fbWidth,screenMode->efbHeight);
+  GX_SetDispCopySrc(0,0,screenMode->fbWidth,screenMode->efbHeight);
+  GX_SetDispCopyDst(screenMode->fbWidth,screenMode->xfbHeight);
+  GX_SetCopyFilter(screenMode->aa,screenMode->sample_pattern,
+           GX_TRUE,screenMode->vfilter);
+  GX_SetFieldMode(screenMode->field_rendering,
+          ((screenMode->viHeight==2*screenMode->xfbHeight)?GX_ENABLE:GX_DISABLE));
 
   GX_SetCullMode(GX_CULL_NONE);
-  GX_CopyDisp(frameBuffer[fb],GX_TRUE);
+  GX_CopyDisp(frameBuffer,GX_TRUE);
   GX_SetDispCopyGamma(GX_GM_1_0);
 
-  // setup the vertex descriptor
-	// tells the flipper to expect direct data
-	GX_ClearVtxDesc();
-	GX_SetVtxDesc(GX_VA_POS, GX_DIRECT);
-	GX_SetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+  guVector camera =	{0.0F, 0.0F, 0.0F};
+  guVector up =	{0.0F, 1.0F, 0.0F};
+  guVector look	= {0.0F, 0.0F, -1.0F};
 
-	// setup the vertex attribute table
-	// describes the data
-	// args: vat location 0-7, type of data, data format, size, scale
-	// so for ex. in the first call we are sending position data with
-	// 3 values X,Y,Z of size F32. scale sets the number of fractional
-	// bits for non float data.
-	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-	GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGB8, 0);
+  guPerspective(projection, 60, 1.33F, 10.0F,	300.0F);
+  GX_LoadProjectionMtx(projection, GX_PERSPECTIVE);
 
-	GX_SetNumChans(1);
-	GX_SetNumTexGens(0);
-	GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
-	GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
+  GX_ClearVtxDesc();
+  GX_SetVtxDesc(GX_VA_POS, GX_INDEX8);
+  GX_SetVtxDesc(GX_VA_CLR0, GX_INDEX8);
+  GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS,	GX_POS_XYZ,	GX_S16,	0);
+  GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8,	0);
+  GX_SetArray(GX_VA_POS, vertices, 3*sizeof(s16));
+  GX_SetArray(GX_VA_CLR0,	colors,	4*sizeof(u8));
+  GX_SetNumChans(1);
+  GX_SetNumTexGens(0);
+  GX_SetTevOrder(GX_TEVSTAGE0, GX_TEXCOORDNULL, GX_TEXMAP_NULL, GX_COLOR0A0);
+  GX_SetTevOp(GX_TEVSTAGE0, GX_PASSCLR);
 
-  // setup our camera at the origin
-  // looking down the -z axis with y up
-  guVector cam  = {0.0F, 0.0F, 0.0F},
-           up   = {0.0F, 1.0F, 0.0F},
-           look = {0.0F, 0.0F, -1.0F};
-  guLookAt(view, &cam, &up, &look);
+  while (1)
+  {
+    guLookAt(viewMatrix, &camera,	&up, &look);
+    GX_SetViewport(0,0,screenMode->fbWidth,screenMode->efbHeight,0,1);
+    GX_InvVtxCache();
+    GX_InvalidateTexAll();
+    
+    Mtx	modelView;
+    guMtxIdentity(modelView);
+    guMtxTransApply(modelView, modelView, 0.0F,	0.0F, -50.0F);
+    guMtxConcat(viewMatrix,modelView, modelView);
 
+    GX_LoadPosMtxImm(modelView,	GX_PNMTX0);
 
-  // setup our projection matrix
-  // this creates a perspective matrix with a view angle of 90,
-  // and aspect ratio based on the display resolution
-  f32 w = rmode->viWidth;
-  f32 h = rmode->viHeight;
-  guPerspective(perspective, 45, (f32)w/h, 0.1F, 300.0F);
-  GX_LoadProjectionMtx(perspective, GX_PERSPECTIVE);
-
-  while(1) {
-
-    WPAD_ScanPads();
-
-    if (WPAD_ButtonsDown(0) & WPAD_BUTTON_HOME) exit(0);
-
-    // do this before drawing
-    GX_SetViewport(0,0,rmode->fbWidth,rmode->efbHeight,0,1);
-
-    // draw triangle
     GX_Begin(GX_TRIANGLES, GX_VTXFMT0, 3);
-      GX_Position3f32(-0.5f, -0.5f, 0.0f);
-      GX_Color3f32(1.0f,0.0f,0.0f);
-      
-      GX_Position3f32( 0.5f, -0.5f, 0.0f);
-      GX_Color3f32(0.0f,1.0f,0.0f);
-      
-      GX_Position3f32( 0.0f,  0.5f, 0.0f);
-      GX_Color3f32(0.0f,0.0f,1.0f);
+      GX_Position1x8(0);
+      GX_Color1x8(0);
+      GX_Position1x8(1);
+      GX_Color1x8(1);
+      GX_Position1x8(2);
+      GX_Color1x8(2);
     GX_End();
 
-    // do this stuff after drawing
     GX_DrawDone();
-
-    fb ^= 1;		// flip framebuffer
-    GX_SetZMode(GX_TRUE, GX_LEQUAL, GX_TRUE);
-    GX_SetColorUpdate(GX_TRUE);
-    GX_CopyDisp(frameBuffer[fb],GX_TRUE);
-
-    VIDEO_SetNextFramebuffer(frameBuffer[fb]);
-
-    VIDEO_Flush();
+    readyForCopy = GX_TRUE;
 
     VIDEO_WaitVSync();
+
+    WPAD_ScanPads();
+    if (WPAD_ButtonsDown(0) & WPAD_BUTTON_HOME) exit(0);
   }
   return 0;
 }
 
+static void	copy_buffers(u32 count __attribute__ ((unused)))
+{
+  if (readyForCopy==GX_TRUE) {
+    GX_SetZMode(GX_TRUE, GX_LEQUAL,	GX_TRUE);
+    GX_SetColorUpdate(GX_TRUE);
+    GX_CopyDisp(frameBuffer,GX_TRUE);
+    GX_Flush();
+    readyForCopy = GX_FALSE;
+  }
+}
